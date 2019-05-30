@@ -104,22 +104,28 @@ export default new Packager({
     });
 
     let sourcemapComment = '// ' + sourceMapPath;
+    let entryAsset = bundle.getEntryAssets()[0];
+    // $FlowFixMe
+    let interpreter: ?string = entryAsset.meta.interpreter;
+
     return {
       contents:
-        PRELUDE +
-        '({' +
-        assets +
-        '},{},' +
-        JSON.stringify(
-          bundle
-            .getEntryAssets()
-            .reverse()
-            .map(asset => asset.id)
-        ) +
-        ', ' +
-        'null' +
-        ')\n' +
-        sourcemapComment,
+        // If the entry asset included a hashbang, repeat it at the top of the bundle
+        (interpreter != null ? `#!${interpreter}\n` : '') +
+        (PRELUDE +
+          '({' +
+          assets +
+          '},{},' +
+          JSON.stringify(
+            bundle
+              .getEntryAssets()
+              .reverse()
+              .map(asset => asset.id)
+          ) +
+          ', ' +
+          'null' +
+          ')\n' +
+          sourcemapComment),
       map
     };
   }
