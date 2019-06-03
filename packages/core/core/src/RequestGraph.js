@@ -1,16 +1,12 @@
 // @flow strict-local
 import {PromiseQueue, md5FromString} from '@parcel/utils';
-import type {
-  AssetRequest,
-  Config,
-  FilePath,
-  ParcelOptions
-} from '@parcel/types';
+import type {AssetRequest, FilePath, ParcelOptions} from '@parcel/types';
 import type {Event} from '@parcel/watcher';
 import WorkerFarm from '@parcel/workers';
 
 import Dependency from './Dependency';
 import Graph, {type GraphOpts} from './Graph';
+import type ParcelConfig from './ParcelConfig';
 import ResolverRunner from './ResolverRunner';
 import type {
   AssetRequestNode,
@@ -24,7 +20,7 @@ import type {
 
 type RequestGraphOpts = {|
   ...GraphOpts<RequestGraphNode>,
-  config: Config,
+  config: ParcelConfig,
   options: ParcelOptions,
   onAssetRequestComplete: (AssetRequestNode, CacheEntry) => mixed,
   onDepPathRequestComplete: (DepPathRequestNode, AssetRequest | null) => mixed
