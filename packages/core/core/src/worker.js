@@ -8,6 +8,7 @@ import TransformerRunner from './TransformerRunner';
 import PackagerRunner from './PackagerRunner';
 import ParcelConfig from './ParcelConfig';
 import Cache from '@parcel/cache';
+import type Config from './Config';
 
 type Options = {|
   config: ParcelConfig,
@@ -33,12 +34,16 @@ export function init({config, options, env}: Options) {
   });
 }
 
-export function runTransform(req: AssetRequest) {
+export function runTransform(
+  req: AssetRequest,
+  loadConfig: () => Promise<Config>,
+  parentNodeId: string
+) {
   if (!transformerRunner) {
     throw new Error('.runTransform() called before .init()');
   }
 
-  return transformerRunner.transform(req);
+  return transformerRunner.transform(req, loadConfig, parentNodeId);
 }
 
 export function runPackage(bundle: Bundle, bundleGraph: BundleGraph) {

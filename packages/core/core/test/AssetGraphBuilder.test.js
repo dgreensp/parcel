@@ -42,7 +42,7 @@ describe('AssetGraphBuilder', () => {
   let config;
   let builder;
   beforeEach(async () => {
-    config = nullthrows(await resolve(path.join(CONFIG_DIR, 'index')));
+    config = nullthrows(await resolve(path.join(CONFIG_DIR, 'index'))).config;
 
     builder = new AssetGraphBuilder({
       options: DEFAULT_OPTIONS,
