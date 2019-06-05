@@ -10,7 +10,8 @@ import type {
   Transformer,
   AssetRequest,
   TransformerResult,
-  ParcelOptions
+  ParcelOptions,
+  PackageName
 } from '@parcel/types';
 import type {CacheEntry} from './types';
 
@@ -42,6 +43,296 @@ type Opts = {|
 type GenerateFunc = (input: IMutableAsset) => Promise<GenerateOutput>;
 
 const BUFFER_LIMIT = 5000000; // 5mb
+
+type TransformationOpts = {|
+  request: AssetRequest,
+  loadConfig: (ConfigRequest, NodeId) => Promise<Config>,
+  parentNodeId: NodeId,
+  options: ParcelOptions
+|};
+
+type ConfigCollection = {
+  [PackageName]: any
+};
+
+export class Transformation {
+  request: AssetRequest;
+  loadConfig: ConfigRequest => Promise<Config>;
+  options: ParcelOptions;
+
+  constructor({
+    request,
+    loadConfig,
+    parentNodeId,
+    options
+  }: TransformationOpts) {
+    this.request = request;
+    this.loadConfig = configRequest => loadConfig(configRequest, parentNodeId);
+    this.options = options;
+  }
+
+  async run() {
+    report({
+      type: 'buildProgress',
+      phase: 'transforming',
+      request: this.request
+    });
+
+    console.log('IN TRANSFORMATION.RUN', this.request);
+    let asset = await this.loadAsset();
+    console.log('INITIAL ASSET', asset);
+
+    return this.runPipeline(asset);
+  }
+
+  async loadAsset() {
+    let {filePath, env, code, sideEffects} = this.request;
+    let {content, size, hash} = await summarizeRequest(this.request);
+
+    return new InternalAsset({
+      // If the transformer request passed code rather than a filename,
+      // use a hash as the base for the id to ensure it is unique.
+      idBase: code ? hash : filePath,
+      filePath: filePath,
+      type: path.extname(filePath).slice(1),
+      ast: null,
+      content,
+      hash,
+      env: env,
+      stats: {
+        time: 0,
+        size
+      },
+      sideEffects
+    });
+  }
+
+  async runPipeline(initialAsset: InternalAsset) {
+    let {pipeline, configs} = await this.loadPipeline(initialAsset.filePath);
+
+    let cacheKey = this.getCacheKey(initialAsset, configs);
+    console.log('CACHE KEY', cacheKey);
+    let cacheEntry = await Cache.get(cacheKey);
+
+    if (cacheEntry) console.log('CACHE ENTRY FOUND', cacheEntry);
+    else console.log('TRANSFORMING');
+
+    let assets = cacheEntry || (await pipeline.transform(initialAsset));
+
+    let finalAssets = [];
+    for (let asset of assets) {
+      if (asset.type !== initialAsset.type) {
+        let nextPipelineAssets = this.runPipeline(asset);
+        finalAssets = finalAssets.concat(nextPipelineAssets);
+      } else {
+        finalAssets.push(asset);
+      }
+    }
+
+    let processedFinalAssets = finalAssets;
+    // pipeline.postProcess
+    //   ? await pipeline.postProcess(assets)
+    //   : finalAssets;
+
+    Cache.set(cacheKey, processedFinalAssets);
+
+    console.log('TRANSFORMATION RESULT', processedFinalAssets);
+
+    return processedFinalAssets;
+  }
+
+  getCacheKey(asset: InternalAsset, configs: ConfigCollection) {
+    let {filePath, content} = asset;
+    return md5FromString(JSON.stringify({filePath, content, configs}));
+  }
+
+  async loadPipeline(filePath: FilePath) {
+    let configRequest = {
+      filePath,
+      meta: {
+        actionType: 'transformation'
+      }
+    };
+
+    let config = await this.loadConfig(configRequest);
+    let parcelConfig = nullthrows(config.result);
+
+    let configs = {
+      parcel: parcelConfig.getTransformerNames(filePath)
+    };
+
+    for (let [moduleName] of config.devDeps) {
+      let plugin = await parcelConfig.result.loadPlugin(moduleName);
+      // TODO: implement loadPlugin in existing plugins that require config
+      if (plugin.loadConfig) {
+        let thirdPartyConfigRequest = await this.loadTransformerConfig(
+          filePath,
+          moduleName,
+          parcelConfig.resolvedPath
+        );
+        let thirdPartyConfig = nullthrows(thirdPartyConfigRequest.result);
+        configs[moduleName] = thirdPartyConfig;
+      }
+    }
+
+    let pipeline = new Pipeline(
+      await parcelConfig.getTransformers(filePath),
+      configs,
+      this.options
+    );
+
+    return {pipeline, configs};
+  }
+
+  async loadTransformerConfig(
+    filePath: FilePath,
+    plugin: PackageName,
+    parcelConfigPath: FilePath
+  ) {
+    let configRequest = {
+      filePath,
+      plugin,
+      meta: {
+        parcelConfigPath
+      }
+    };
+    return this.loadConfig(configRequest);
+  }
+}
+
+class Pipeline {
+  transformers: Array<Transformer>;
+  options: ParcelOptions;
+  resolverRunner: ResolverRunner;
+
+  constructor(
+    transformers: Array<Transformer>,
+    configs: ConfigCollection,
+    options: ParcelOptions,
+    config: ParcelConfig
+  ) {
+    this.transformers = transformers;
+    this.options = options;
+    this.resolverRunner = new ResolverRunner({
+      config,
+      options
+    });
+  }
+
+  async transform(initialAsset: InternalAsset) {
+    let inputAssets = [initialAsset];
+    let resultingAssets;
+    let finalAssets = [];
+    for (let transformer of this.transformers) {
+      resultingAssets = [];
+      for (let asset of inputAssets) {
+        if (asset.type !== initialAsset.type) {
+          finalAssets.push(asset);
+        } else {
+          resultingAssets = resultingAssets.concat(
+            await this.runTransformer(asset, transformer)
+          );
+        }
+      }
+
+      inputAssets = resultingAssets;
+    }
+
+    finalAssets = finalAssets.concat(resultingAssets);
+
+    return finalAssets;
+  }
+
+  async runTransformer(asset: InternalAsset, transformer: Transformer) {
+    const resolve = async (from: FilePath, to: string): Promise<FilePath> => {
+      return (await this.resolverRunner.resolve(
+        new Dependency({
+          env: asset.env,
+          moduleSpecifier: to,
+          sourcePath: from
+        })
+      )).filePath;
+    };
+
+    // Load config for the transformer.
+    let config = null;
+    if (transformer.getConfig) {
+      config = await transformer.getConfig({
+        asset: new MutableAsset(asset),
+        options: this.options,
+        resolve
+      });
+    }
+
+    // If an ast exists on the asset, but we cannot reuse it,
+    // use the previous transform to generate code that we can re-parse.
+    if (
+      asset.ast &&
+      (!transformer.canReuseAST ||
+        !transformer.canReuseAST({ast: asset.ast, options: this.options})) &&
+      this.generate
+    ) {
+      let output = await this.generate(new MutableAsset(asset));
+      asset.content = output.code;
+      asset.ast = null;
+    }
+
+    // Parse if there is no AST available from a previous transform.
+    if (!asset.ast && transformer.parse) {
+      asset.ast = await transformer.parse({
+        asset: new MutableAsset(asset),
+        config,
+        options: this.options
+      });
+    }
+
+    // Transform.
+    let results = await normalizeAssets(
+      // $FlowFixMe
+      await transformer.transform({
+        asset: new MutableAsset(asset),
+        config,
+        options: this.options
+      })
+    );
+
+    // Create generate and postProcess functions that can be called later
+    this.generate = async (input: IMutableAsset): Promise<GenerateOutput> => {
+      if (transformer.generate) {
+        return transformer.generate({
+          asset: input,
+          config,
+          options: this.options
+        });
+      }
+
+      throw new Error(
+        'Asset has an AST but no generate method is available on the transform'
+      );
+    };
+
+    this.postProcess = async (
+      assets: Array<InternalAsset>
+    ): Promise<Array<InternalAsset> | null> => {
+      let {postProcess} = transformer;
+      if (postProcess) {
+        let results = await postProcess({
+          assets: assets.map(asset => new MutableAsset(asset)),
+          config,
+          options: this.options
+        });
+
+        return Promise.all(
+          results.map(result => asset.createChildAsset(result))
+        );
+      }
+
+      return null;
+    };
+
+    return results;
+  }
+}
 
 export default class TransformerRunner {
   options: ParcelOptions;
